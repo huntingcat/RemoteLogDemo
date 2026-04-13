@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RemoteLog - 远程日志查看器</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f1f5f9; color: #1e293b; min-height: 100vh; }
+    header { background: #ffffff; border-bottom: 1px solid #e2e8f0; padding: 16px 24px; position: sticky; top: 0; z-index: 100; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+    .logo { font-size: 18px; font-weight: 700; color: #4f46e5; white-space: nowrap; }
+    .status { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #64748b; white-space: nowrap; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
+    .dot.error { background: #ef4444; }
+    .controls { display: flex; gap: 10px; margin-left: auto; align-items: center; flex-wrap: wrap; }
+    input[type=text] { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 7px 14px; color: #1e293b; font-size: 14px; width: 260px; outline: none; }
+    input[type=text]:focus { border-color: #4f46e5; box-shadow: 0 0 0 3px #4f46e51a; }
+    input[type=text]::placeholder { color: #94a3b8; }
+    .btn { padding: 7px 14px; border-radius: 8px; border: none; font-size: 13px; cursor: pointer; font-weight: 500; transition: opacity .15s; }
+    .btn:hover { opacity: .85; }
+    .btn-clear { background: #ef4444; color: #fff; }
+    .btn-pause { background: #e2e8f0; color: #475569; }
+    .btn-pause.active { background: #f59e0b; color: #fff; }
+    .counter { font-size: 12px; color: #94a3b8; white-space: nowrap; }
+    main { padding: 16px 24px; max-width: 1200px; margin: 0 auto; }
+    .log-list { display: flex; flex-direction: column; gap: 8px; }
+    .log-item { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 16px; display: grid; grid-template-columns: auto 1fr auto; gap: 8px 14px; align-items: start; transition: border-color .15s, box-shadow .15s; }
+    .log-item:hover { border-color: #a5b4fc; box-shadow: 0 2px 8px rgba(79,70,229,.08); }
+    .log-item.new { animation: fadeIn .3s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+    .log-index { font-size: 11px; color: #cbd5e1; padding-top: 2px; min-width: 28px; text-align: right; }
+    .log-body { display: flex; flex-direction: column; gap: 4px; }
+    .log-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 20px; background: #ede9fe; color: #4f46e5; white-space: nowrap; }
+    .log-time { font-size: 12px; color: #94a3b8; }
+    .log-device { font-size: 12px; color: #94a3b8; }
+    .log-detail { font-size: 13px; color: #475569; margin-top: 2px; word-break: break-all; }
+    .empty { text-align: center; padding: 80px 0; color: #94a3b8; font-size: 15px; }
+    .empty span { display: block; font-size: 40px; margin-bottom: 12px; }
+    mark { background: #ede9fe; color: #4f46e5; border-radius: 3px; padding: 0 2px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">📋 RemoteLog</div>
+    <div class="status">
+      <div class="dot" id="dot"></div>
+      <span id="statusText">连接中…</span>
+    </div>
+    <div class="controls">
+      <input type="text" id="searchInput" placeholder="搜索事件名、设备、详情…" oninput="renderLogs()">
+      <button class="btn btn-pause" id="pauseBtn" onclick="togglePause()">暂停刷新</button>
+      <button class="btn btn-clear" onclick="clearLogs()">清空日志</button>
+      <span class="counter" id="counter">0 条</span>
+    </div>
+  </header>
+  <main>
+    <div class="log-list" id="logList"></div>
+    <div class="empty" id="emptyState" style="display:none"><span>🔍</span>暂无日志，等待 iOS 端操作…</div>
+  </main>
+
+  <script>
+    let allLogs = [];
+    let paused = false;
+    let lastErrorCount = 0;
+
+    function togglePause() {
+      paused = !paused;
+      const btn = document.getElementById('pauseBtn');
+      btn.textContent = paused ? '继续刷新' : '暂停刷新';
+      btn.classList.toggle('active', paused);
+    }
+
+    function highlight(text, keyword) {
+      if (!keyword) return escapeHtml(text);
+      const escaped = escapeHtml(text);
+      const k = escapeHtml(keyword);
+      return escaped.replace(new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), m => '<mark>' + m + '</mark>');
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function formatTime(iso) {
+      try {
+        const d = new Date(iso);
+        const pad = n => String(n).padStart(2,'0');
+        return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '.' + String(d.getMilliseconds()).padStart(3,'0');
+      } catch { return iso; }
+    }
+
+    function renderLogs() {
+      const keyword = document.getElementById('searchInput').value.trim().toLowerCase();
+      const filtered = keyword
+        ? allLogs.filter(l =>
+            l.eventName.toLowerCase().includes(keyword) ||
+            l.deviceModel.toLowerCase().includes(keyword) ||
+            l.osVersion.toLowerCase().includes(keyword) ||
+            l.detail.toLowerCase().includes(keyword)
+          )
+        : allLogs;
+
+      const list = document.getElementById('logList');
+      const empty = document.getElementById('emptyState');
+      document.getElementById('counter').textContent = filtered.length + ' 条';
+
+      if (filtered.length === 0) {
+        list.innerHTML = '';
+        empty.style.display = 'block';
+        return;
+      }
+      empty.style.display = 'none';
+
+      const reversed = [...filtered].reverse();
+      list.innerHTML = reversed.map((log, i) => `
+        <div class="log-item">
+          <div class="log-index">${filtered.length - i}</div>
+          <div class="log-body">
+            <div class="log-header">
+              <span class="badge">${highlight(log.eventName, keyword)}</span>
+              <span class="log-time">${formatTime(log.timestamp)}</span>
+              <span class="log-device">${highlight(log.deviceModel, keyword)} · ${highlight(log.osVersion, keyword)}</span>
+            </div>
+            ${log.detail ? '<div class="log-detail">' + highlight(log.detail, keyword) + '</div>' : ''}
+          </div>
+        </div>
+      `).join('');
+    }
+
+    async function fetchLogs() {
+      if (paused) return;
+      try {
+        const res = await fetch('/api/logs');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        allLogs = data;
+        lastErrorCount = 0;
+        document.getElementById('dot').className = 'dot';
+        document.getElementById('statusText').textContent = '实时连接中';
+        renderLogs();
+      } catch (e) {
+        lastErrorCount++;
+        if (lastErrorCount >= 2) {
+          document.getElementById('dot').className = 'dot error';
+          document.getElementById('statusText').textContent = '连接失败，重试中…';
+        }
+      }
+    }
+
+    async function clearLogs() {
+      if (!confirm('确认清空所有日志？')) return;
+      try {
+        await fetch('/api/logs', { method: 'DELETE' });
+        allLogs = [];
+        renderLogs();
+      } catch {}
+    }
+
+    fetchLogs();
+    setInterval(fetchLogs, 1000);
+  </script>
+</body>
+</html>
